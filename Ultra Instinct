@@ -1,0 +1,1357 @@
+--// Ultra Instinct - Full Script with Modern UI & Persistence (Updated v1.3 - Fixed Close Shutdown)
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local TextService = game:GetService("TextService")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+
+local localPlayer = Players.LocalPlayer
+local guiParent = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or localPlayer:WaitForChild("PlayerGui")
+
+local scriptActive = true
+
+--------------------------------------------------------------------
+-- Config + Theme + Persistence
+--------------------------------------------------------------------
+local Config = {
+    Enabled = false,
+    AutoCounter = true,
+    AutoBlock = false,
+    AutoProj = false,
+    DashRange = 22,
+    M1Range = 12,
+    MoveRange = 20,
+    ProjRange = 35,
+    ProjMinRange = 12,
+    MinRange = 4,
+    MoveDelay = 0.2,
+    BlockDelay = 0.09,
+}
+
+local Defaults = table.clone(Config)
+local saveFileName = "UltraInstinctConfig.json"
+
+local function saveConfig()
+    pcall(function()
+        if writefile then
+            writefile(saveFileName, HttpService:JSONEncode(Config))
+        end
+    end)
+end
+
+local function loadConfig()
+    pcall(function()
+        if isfile and readfile and isfile(saveFileName) then
+            local decoded = HttpService:JSONDecode(readfile(saveFileName))
+            if type(decoded) == "table" then
+                for k, v in pairs(decoded) do
+                    if Config[k] ~= nil and type(Config[k]) == type(v) then
+                        Config[k] = v
+                    end
+                end
+            end
+        end
+    end)
+end
+
+loadConfig()
+
+local isEnabled = Config.Enabled
+local autoM1Enabled = Config.AutoCounter
+local autoBlockEnabled = Config.AutoBlock
+local autoProjEnabled = Config.AutoProj
+
+local currentDashRange = Config.DashRange
+local currentM1Range = Config.M1Range
+local currentMoveRange = Config.MoveRange
+local currentProjRange = Config.ProjRange
+local currentProjMinRange = Config.ProjMinRange
+local currentMinRange = Config.MinRange
+local currentMoveDelay = Config.MoveDelay
+local currentBlockDelay = Config.BlockDelay
+
+local COOLDOWN = 0.25
+local PROJ_COOLDOWN = 0.35
+local lastTeleportTime = 0
+local lastProjTime = 0
+local lastDodgeId = nil
+local lockOnConnection = nil
+local m1LockedOutUntil = 0
+local currentSpecialCleanup = nil
+
+local Theme = {
+    Background = Color3.fromRGB(16, 16, 18),
+    Hover = Color3.fromRGB(28, 28, 32),
+    Line = Color3.fromRGB(46, 46, 52),
+    LineStrong = Color3.fromRGB(96, 96, 106),
+    Text = Color3.fromRGB(226, 226, 232),
+    Dim = Color3.fromRGB(122, 122, 134),
+    Accent = Color3.fromRGB(196, 210, 236),
+    OnAccent = Color3.fromRGB(16, 16, 18),
+    Radius = 2,
+    TitleFont = Enum.Font.SourceSansSemibold,
+    LabelFont = Enum.Font.SourceSans,
+    ValueFont = Enum.Font.RobotoMono,
+}
+
+--------------------------------------------------------------------
+-- Helpers & UI Framework
+--------------------------------------------------------------------
+local connections = {}
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+local function create(class, props, children)
+    local inst = Instance.new(class)
+    local parent
+    for k, v in pairs(props or {}) do
+        if k == "Parent" then
+            parent = v
+        else
+            inst[k] = v
+        end
+    end
+    for _, child in ipairs(children or {}) do
+        child.Parent = inst
+    end
+    inst.Parent = parent
+    return inst
+end
+
+local function corner(radius)
+    return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function stroke(color)
+    return create("UIStroke", {
+        Color = color,
+        Thickness = 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    })
+end
+
+local TWEEN_INFO = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local function tween(inst, props, instant)
+    if instant then
+        for k, v in pairs(props) do
+            inst[k] = v
+        end
+    else
+        TweenService:Create(inst, TWEEN_INFO, props):Play()
+    end
+end
+
+local Changed = Instance.new("BindableEvent")
+local updateHandlers = {}
+
+local function setConfig(key, value)
+    Config[key] = value
+    Changed:Fire(key, value)
+    saveConfig()
+end
+
+Changed.Event:Connect(function(key, value)
+    if key == "Enabled" then isEnabled = value
+    elseif key == "AutoCounter" then
+        autoM1Enabled = value
+        if value then
+            autoBlockEnabled = false
+            Config.AutoBlock = false
+            if updateHandlers["AutoBlock"] then updateHandlers["AutoBlock"](false) end
+        end
+    elseif key == "AutoBlock" then
+        autoBlockEnabled = value
+        if value then
+            autoM1Enabled = false
+            Config.AutoCounter = false
+            if updateHandlers["AutoCounter"] then updateHandlers["AutoCounter"](false) end
+        end
+    elseif key == "AutoProj" then autoProjEnabled = value
+    elseif key == "DashRange" then currentDashRange = value
+    elseif key == "M1Range" then currentM1Range = value
+    elseif key == "MoveRange" then currentMoveRange = value
+    elseif key == "ProjRange" then currentProjRange = value
+    elseif key == "ProjMinRange" then currentProjMinRange = value
+    elseif key == "MinRange" then currentMinRange = value
+    elseif key == "MoveDelay" then currentMoveDelay = value
+    elseif key == "BlockDelay" then currentBlockDelay = value
+    end
+
+    if updateHandlers[key] then
+        updateHandlers[key](value)
+    end
+end)
+
+--------------------------------------------------------------------
+-- Window Setup
+--------------------------------------------------------------------
+local old = guiParent:FindFirstChild("UltraInstinctUI")
+if old then
+    old:Destroy()
+end
+
+local screenGui = create("ScreenGui", {
+    Name = "UltraInstinctUI",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    Parent = guiParent,
+})
+
+local main = create("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(250, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    Position = UDim2.new(0.5, -125, 0.5, -230),
+    BackgroundColor3 = Theme.Background,
+    BorderSizePixel = 0,
+    Parent = screenGui,
+}, {
+    corner(Theme.Radius + 1),
+    stroke(Theme.Line),
+    create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }),
+})
+
+-- Header ------------------------------------------------------------
+local header = create("Frame", {
+    Name = "Header",
+    Size = UDim2.new(1, 0, 0, 34),
+    BackgroundTransparency = 1,
+    LayoutOrder = 1,
+    Parent = main,
+})
+
+local dragArea = create("Frame", {
+    Name = "DragArea",
+    Size = UDim2.new(1, -70, 1, 0),
+    BackgroundTransparency = 1,
+    Parent = header,
+})
+
+create("TextLabel", {
+    Position = UDim2.fromOffset(12, 0),
+    Size = UDim2.new(1, -12, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "Ultra Instinct",
+    Font = Theme.TitleFont,
+    TextSize = 17,
+    TextColor3 = Theme.Text,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = dragArea,
+})
+
+local function iconButton(xOffset)
+    local btn = create("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, xOffset, 0.5, 0),
+        Size = UDim2.fromOffset(26, 26),
+        BackgroundColor3 = Theme.Hover,
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        Parent = header,
+    }, { corner(Theme.Radius) })
+
+    local bars = {}
+    local function addBar(w, h, rotation)
+        local b = create("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromScale(0.5, 0.5),
+            Size = UDim2.fromOffset(w, h),
+            Rotation = rotation or 0,
+            BackgroundColor3 = Theme.Dim,
+            BorderSizePixel = 0,
+            Parent = btn,
+        })
+        table.insert(bars, b)
+        return b
+    end
+
+    btn.MouseEnter:Connect(function()
+        tween(btn, { BackgroundTransparency = 0 })
+        for _, b in ipairs(bars) do
+            tween(b, { BackgroundColor3 = Theme.Text })
+        end
+    end)
+    btn.MouseLeave:Connect(function()
+        tween(btn, { BackgroundTransparency = 1 })
+        for _, b in ipairs(bars) do
+            tween(b, { BackgroundColor3 = Theme.Dim })
+        end
+    end)
+
+    return btn, addBar
+end
+
+local minBtn, addMinBar = iconButton(-34)
+addMinBar(10, 2)
+local plusBar = addMinBar(2, 10)
+plusBar.Visible = false
+
+local closeBtn, addCloseBar = iconButton(-6)
+addCloseBar(14, 2, 45)
+addCloseBar(14, 2, -45)
+
+create("Frame", {
+    Name = "HeaderLine",
+    Size = UDim2.new(1, 0, 0, 1),
+    BackgroundColor3 = Theme.Line,
+    BorderSizePixel = 0,
+    LayoutOrder = 2,
+    Parent = main,
+})
+
+-- Body --------------------------------------------------------------
+local body = create("Frame", {
+    Name = "Body",
+    Size = UDim2.new(1, 0, 0, 0),
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    LayoutOrder = 3,
+    Parent = main,
+}, {
+    create("UIPadding", {
+        PaddingTop = UDim.new(0, 10),
+        PaddingBottom = UDim.new(0, 8),
+        PaddingLeft = UDim.new(0, 12),
+        PaddingRight = UDim.new(0, 12),
+    }),
+    create("UIListLayout", {
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 2),
+    }),
+})
+
+local order = 0
+local function nextOrder()
+    order += 1
+    return order
+end
+
+local function spacer(height)
+    create("Frame", {
+        Size = UDim2.new(1, 0, 0, height),
+        BackgroundTransparency = 1,
+        LayoutOrder = nextOrder(),
+        Parent = body,
+    })
+end
+
+-- Status Button -----------------------------------------------------
+local masterHover = false
+local masterStroke = stroke(Theme.Line)
+local master = create("TextButton", {
+    Size = UDim2.new(1, 0, 0, 30),
+    AutoButtonColor = false,
+    BackgroundColor3 = Theme.Accent,
+    BackgroundTransparency = 1,
+    Text = "",
+    Font = Theme.TitleFont,
+    TextSize = 15,
+    LayoutOrder = nextOrder(),
+    Parent = body,
+}, { corner(Theme.Radius), masterStroke })
+
+local function renderMaster(instant)
+    local on = Config.Enabled
+    master.Text = on and "Status: on" or "Status: off"
+    tween(master, {
+        BackgroundTransparency = on and 0 or 1,
+        TextColor3 = on and Theme.OnAccent or (masterHover and Theme.Text or Theme.Dim),
+    }, instant)
+    tween(masterStroke, {
+        Color = on and Theme.Accent or (masterHover and Theme.LineStrong or Theme.Line),
+    }, instant)
+end
+renderMaster(true)
+
+updateHandlers["Enabled"] = function()
+    renderMaster()
+end
+
+master.MouseEnter:Connect(function()
+    masterHover = true
+    renderMaster()
+end)
+master.MouseLeave:Connect(function()
+    masterHover = false
+    renderMaster()
+end)
+master.Activated:Connect(function()
+    setConfig("Enabled", not Config.Enabled)
+    renderMaster()
+end)
+
+-- Components --------------------------------------------------------
+local function section(text)
+    local width = TextService:GetTextSize(text, 14, Theme.TitleFont, Vector2.new(1000, 100)).X
+    local holder = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundTransparency = 1,
+        LayoutOrder = nextOrder(),
+        Parent = body,
+    })
+    create("TextLabel", {
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.new(0, 0, 1, 0),
+        Size = UDim2.fromOffset(width + 2, 16),
+        BackgroundTransparency = 1,
+        Text = text,
+        Font = Theme.TitleFont,
+        TextSize = 14,
+        TextColor3 = Theme.Dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = holder,
+    })
+    create("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, width + 10, 1, -8),
+        Size = UDim2.new(1, -(width + 10), 0, 1),
+        BackgroundColor3 = Theme.Line,
+        BorderSizePixel = 0,
+        Parent = holder,
+    })
+end
+
+local function createToggle(text, key)
+    local row = create("TextButton", {
+        Size = UDim2.new(1, 0, 0, 26),
+        BackgroundColor3 = Theme.Hover,
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        LayoutOrder = nextOrder(),
+        Parent = body,
+    }, { corner(Theme.Radius) })
+
+    local boxStroke = stroke(Theme.LineStrong)
+    local box = create("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 8, 0.5, 0),
+        Size = UDim2.fromOffset(12, 12),
+        BackgroundTransparency = 1,
+        Parent = row,
+    }, { corner(Theme.Radius), boxStroke })
+
+    local fill = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundColor3 = Theme.Accent,
+        BorderSizePixel = 0,
+        Parent = box,
+    })
+
+    local label = create("TextLabel", {
+        Position = UDim2.fromOffset(30, 0),
+        Size = UDim2.new(1, -30, 1, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        Font = Theme.LabelFont,
+        TextSize = 16,
+        TextColor3 = Theme.Dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+
+    local function render(instant)
+        local on = Config[key]
+        tween(fill, { Size = on and UDim2.fromOffset(6, 6) or UDim2.fromOffset(0, 0) }, instant)
+        tween(boxStroke, { Color = on and Theme.Accent or Theme.LineStrong }, instant)
+        tween(label, { TextColor3 = on and Theme.Text or Theme.Dim }, instant)
+    end
+    render(true)
+
+    updateHandlers[key] = function()
+        render()
+    end
+
+    row.MouseEnter:Connect(function()
+        tween(row, { BackgroundTransparency = 0 })
+    end)
+    row.MouseLeave:Connect(function()
+        tween(row, { BackgroundTransparency = 1 })
+    end)
+    row.Activated:Connect(function()
+        if key == "AutoCounter" and not Config.AutoCounter then
+            setConfig("AutoCounter", true)
+            setConfig("AutoBlock", false)
+        elseif key == "AutoBlock" and not Config.AutoBlock then
+            setConfig("AutoBlock", true)
+            setConfig("AutoCounter", false)
+        else
+            setConfig(key, not Config[key])
+        end
+        render()
+    end)
+end
+
+local function createInput(text, key, min, max)
+    local row = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 26),
+        BackgroundTransparency = 1,
+        LayoutOrder = nextOrder(),
+        Parent = body,
+    })
+
+    create("TextLabel", {
+        Position = UDim2.fromOffset(8, 0),
+        Size = UDim2.new(1, -80, 1, 0),
+        BackgroundTransparency = 1,
+        Text = text,
+        Font = Theme.LabelFont,
+        TextSize = 16,
+        TextColor3 = Theme.Dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = row,
+    })
+
+    local box = create("TextBox", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -4, 0.5, 0),
+        Size = UDim2.fromOffset(60, 22),
+        BackgroundTransparency = 1,
+        Text = tostring(Config[key]),
+        ClearTextOnFocus = false,
+        Font = Theme.ValueFont,
+        TextSize = 13,
+        TextColor3 = Theme.Text,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Parent = row,
+    })
+
+    local underline = create("Frame", {
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.new(0, 0, 1, 0),
+        Size = UDim2.new(1, 0, 0, 1),
+        BackgroundColor3 = Theme.Line,
+        BorderSizePixel = 0,
+        Parent = box,
+    })
+
+    updateHandlers[key] = function(val)
+        box.Text = tostring(val)
+    end
+
+    box.Focused:Connect(function()
+        tween(underline, { BackgroundColor3 = Theme.Accent })
+    end)
+    box.FocusLost:Connect(function()
+        tween(underline, { BackgroundColor3 = Theme.Line })
+        local n = tonumber(box.Text)
+        if n then
+            setConfig(key, math.clamp(n, min, max))
+        end
+        box.Text = tostring(Config[key])
+    end)
+end
+
+-- Content UI Elements -----------------------------------------------
+section("modules")
+createToggle("Auto Counter", "AutoCounter")
+createToggle("Auto Block", "AutoBlock")
+createToggle("Auto Proj", "AutoProj")
+
+section("range (studs)")
+createInput("Dash Range", "DashRange", 0, 500)
+createInput("M1 Range", "M1Range", 0, 500)
+createInput("Move Range", "MoveRange", 0, 500)
+createInput("Proj Range", "ProjRange", 0, 500)
+createInput("Proj Min Range", "ProjMinRange", 0, 100)
+createInput("Min Range", "MinRange", 0, 100)
+
+section("timing (sec)")
+createInput("Move Delay", "MoveDelay", 0, 5)
+createInput("Block Delay", "BlockDelay", 0, 5)
+
+spacer(10)
+
+-- Restore Settings Functionality ------------------------------------
+local function restoreSettings()
+    for k, v in pairs(Defaults) do
+        setConfig(k, v)
+    end
+end
+
+local restoreStroke = stroke(Theme.Line)
+local restore = create("TextButton", {
+    Size = UDim2.new(1, 0, 0, 28),
+    BackgroundColor3 = Theme.Hover,
+    BackgroundTransparency = 1,
+    AutoButtonColor = false,
+    Text = "Restore settings",
+    Font = Theme.LabelFont,
+    TextSize = 16,
+    TextColor3 = Theme.Dim,
+    LayoutOrder = nextOrder(),
+    Parent = body,
+}, { corner(Theme.Radius), restoreStroke })
+
+restore.MouseEnter:Connect(function()
+    tween(restore, { BackgroundTransparency = 0, BackgroundColor3 = Theme.Hover, TextColor3 = Theme.Text })
+    tween(restoreStroke, { Color = Theme.LineStrong })
+end)
+restore.MouseLeave:Connect(function()
+    tween(restore, { BackgroundTransparency = 1, TextColor3 = Theme.Dim })
+    tween(restoreStroke, { Color = Theme.Line })
+end)
+restore.MouseButton1Down:Connect(function()
+    tween(restore, { BackgroundColor3 = Theme.Line })
+end)
+restore.MouseButton1Up:Connect(function()
+    tween(restore, { BackgroundColor3 = Theme.Hover })
+end)
+restore.Activated:Connect(restoreSettings)
+
+create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 22),
+    BackgroundTransparency = 1,
+    Text = "RightShift  hide / show",
+    Font = Theme.LabelFont,
+    TextSize = 13,
+    TextColor3 = Theme.Dim,
+    LayoutOrder = nextOrder(),
+    Parent = body,
+})
+
+create("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 22),
+    BackgroundTransparency = 1,
+    Text = "credits: TrainXPloit",
+    Font = Theme.LabelFont,
+    TextSize = 13,
+    TextColor3 = Theme.Dim,
+    LayoutOrder = nextOrder(),
+    Parent = body,
+})
+
+--------------------------------------------------------------------
+-- UI Behavior: Drag, Minimize, Close, Hide Key
+--------------------------------------------------------------------
+local dragging, dragStart, startPos
+dragArea.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+local minimized = false
+minBtn.Activated:Connect(function()
+    minimized = not minimized
+    body.Visible = not minimized
+    plusBar.Visible = minimized
+end)
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+        main.Visible = not main.Visible
+    end
+end)
+
+closeBtn.Activated:Connect(function()
+    scriptActive = false
+    isEnabled = false
+    Config.Enabled = false
+
+    if currentSpecialCleanup then
+        pcall(currentSpecialCleanup)
+        currentSpecialCleanup = nil
+    end
+
+    if lockOnConnection then
+        lockOnConnection:Disconnect()
+        lockOnConnection = nil
+    end
+
+    local camera = Workspace.CurrentCamera
+    if camera then
+        camera.CameraType = Enum.CameraType.Custom
+        if localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid") then
+            camera.CameraSubject = localPlayer.Character:FindFirstChildOfClass("Humanoid")
+        end
+    end
+
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+
+    screenGui:Destroy()
+end)
+
+--------------------------------------------------------------------
+-- Databases & Dodge Logic
+--------------------------------------------------------------------
+local dodgeIds = {
+    "103513893010999", "140381676724931", "111214152450580", "85003123457049", 
+    "136807071694451", "99026585086806", "97396408415659", "97803359940506", "127453446770583"
+}
+
+local chaseDashIds = {
+    ["120951759618134"] = true, ["124777463468279"] = true, ["86626502434817"] = true, 
+    ["130135202362252"] = true, ["140597320237985"] = true, ["81708642912019"] = true, 
+    ["122074769949629"] = true, ["134917827147266"] = true, ["128267680345523"] = true, 
+    ["138169151223960"] = true, ["83782195794718"] = true, ["105571879949076"] = true, 
+    ["76470718091246"] = true, ["106224500692893"] = true
+}
+
+local m1Ids = {
+    ["127851700400958"] = true, ["72548435296350"] = true, ["84547415708554"] = true,
+    ["134243365075812"] = true, ["92966188946988"] = true, ["110978068388232"] = true,
+    ["95295463826732"] = true, ["105077924973072"] = true, ["124862357369335"] = true,
+    ["81630213087988"] = true, ["96185406489877"] = true, ["119042572747325"] = true,
+    ["105287938257399"] = true, ["94588892125071"] = true, ["97868312130612"] = true,
+    ["140588454098230"] = true, ["138826758216894"] = true, ["109299799610861"] = true,
+    ["99451940496871"] = true, ["75337033003776"] = true, ["138489871864252"] = true,
+    ["126277739156443"] = true, ["99710481887795"] = true, ["121322029260156"] = true,
+    ["122655618588472"] = true, ["98845475810982"] = true, ["96327114254575"] = true,
+    ["107029561762376"] = true, ["117831239064143"] = true, ["85068785050521"] = true,
+    ["79086910454958"] = true, ["108027796023968"] = true, ["99205259396653"] = true,
+    ["130284226842903"] = true, ["133936641185614"] = true, ["122573730331631"] = true,
+    ["82400997593751"] = true, ["118634493886688"] = true, ["115586282387431"] = true,
+    ["132855702748568"] = true, ["131909724908049"] = true, ["72575786212990"] = true,
+    ["119248903710146"] = true, ["123168328205349"] = true, ["84989753395518"] = true, 
+    ["104087365067491"] = true, ["97215638330770"] = true, ["100474683542881"] = true, 
+    ["131279921755936"] = true, ["96433049733325"] = true, ["133240987753043"] = true, 
+    ["130806585141471"] = true, ["131967150738931"] = true, ["73456086297777"] = true, 
+    ["111750364977569"] = true, ["84442064935420"] = true, ["139833047658617"] = true, 
+    ["79271374075726"] = true, ["84080901810314"] = true, ["125689391910002"] = true,
+    ["98783064085844"] = true, ["85148168523745"] = true, ["108686045412945"] = true,
+    ["79718433989469"] = true, ["77583711129628"] = true, ["116910683335467"] = true,
+    ["108708446862011"] = true, ["101283990868172"] = true, ["97207871642820"] = true,
+    ["84359513001979"] = true, ["79436586236026"] = true, ["102285403332509"] = true,
+    ["104137631480391"] = true, ["78540777177847"] = true, ["133447840605824"] = true,
+    ["113963875117859"] = true, ["106282708121342"] = true, ["101681158700275"] = true,
+    ["112976111828157"] = true, ["119152716475706"] = true, ["100040983719699"] = true,
+    ["114985590391235"] = true, ["108449614447004"] = true, ["122170399962557"] = true,
+    ["117638619792450"] = true, ["136978371933277"] = true, ["87792276744794"] = true,
+    ["111083699259354"] = true, ["88849926869776"] = true, ["89537672683114"] = true, 
+    ["109598602517674"] = true, ["92698956945928"] = true, ["105961366724096"] = true,
+    ["86519781516542"] = true, ["123591522021548"] = true, ["124726819047447"] = true,
+    ["129583539805939"] = true, ["136466703751033"] = true, ["106892235857467"] = true, 
+    ["93623649598782"] = true, ["128057999506702"] = true, ["76372421343979"] = true, 
+    ["107852433150124"] = true, ["80809423999548"] = true, ["135805825263494"] = true, 
+    ["110958607174992"] = true
+}
+
+local moveIds = {
+    ["128537969081721"] = true, ["115432081398704"] = true, ["81007905598407"] = true, 
+    ["104793932628579"] = true, ["70840150456007"] = true, ["118652212972529"] = true, 
+    ["109787638891072"] = true, ["137865634124104"] = true, ["138397779795066"] = true, 
+    ["124982438761606"] = true, ["137638103122538"] = true, ["135411487367370"] = true, 
+    ["115042679536959"] = true, ["89582140026963"] = true, ["121984128639453"] = true, 
+    ["95852624447551"] = true, ["127727754867974"] = true, ["121923107958102"] = true, 
+    ["132928484483887"] = true, ["117836779292116"] = true, ["87805684702890"] = true, 
+    ["86073608599582"] = true, ["101162958113766"] = true, ["120319825505172"] = true, 
+    ["126362899488198"] = true, ["130834106305514"] = true, ["134917827147266"] = true, 
+    ["99942519870898"] = true, ["72932825817330"] = true, ["81786875517933"] = true, 
+    ["104824728032437"] = true, ["95421145178968"] = true, ["110906451704074"] = true, 
+    ["71783955283661"] = true, ["136338232194928"] = true, ["78578012001859"] = true, 
+    ["100962226150441"] = true, ["133042937840159"] = true, ["135894053646223"] = true, 
+    ["115097960689033"] = true, ["89888040037257"] = true, ["138826705245289"] = true, 
+    ["133869529005453"] = true, ["137007125977081"] = true, ["95097480425566"] = true, 
+    ["115561023870463"] = true, ["93429614171877"] = true, ["96466374346823"] = true, 
+    ["130957217409359"] = true, ["81112033595734"] = true, ["88650187820094"] = true, 
+    ["117465720955224"] = true, ["100108404823407"] = true, ["128779949980528"] = true, 
+    ["132281807148575"] = true, ["117318845383884"] = true, ["84870056161157"] = true, 
+    ["131826588098422"] = true, ["116119661056362"] = true, ["82149987460883"] = true, 
+    ["114921503094291"] = true, ["118813489101356"] = true, ["121158593063065"] = true, 
+    ["103960582499076"] = true, ["93901924492394"] = true, ["137611726964398"] = true, 
+    ["136658834297626"] = true, ["110326542726854"] = true, ["118326207788271"] = true, 
+    ["88215274584883"] = true, ["111077341852080"] = true, ["108319980293313"] = true, 
+    ["83430571986421"] = true, ["107554693613496"] = true, ["77200218033775"] = true, 
+    ["113479860283691"] = true, ["76519264603956"] = true, ["132704398648016"] = true, 
+    ["81953935260783"] = true, ["127171275866632"] = true, ["105191773344078"] = true, 
+    ["84737448668938"] = true, ["124340599144108"] = true, ["124759375124281"] = true, 
+    ["71262912144187"] = true, ["114321791577837"] = true, ["116737527523542"] = true, 
+    ["102532077942921"] = true, ["127457641316758"] = true, ["84784070267976"] = true, 
+    ["103659500760745"] = true, ["140595869234331"] = true, ["131092994606135"] = true, 
+    ["124901309160375"] = true, ["80552926761100"] = true, ["87481059409847"] = true, 
+    ["75390215999547"] = true, ["93028763593631"] = true, ["85938446097801"] = true, 
+    ["101617544363219"] = true, ["89092734635186"] = true, ["94347210073500"] = true, 
+    ["132725601768618"] = true, ["86362077638309"] = true, ["124937162378188"] = true, 
+    ["125904281673524"] = true, ["102053631728986"] = true, ["72343192576784"] = true, 
+    ["73243807139765"] = true, ["76270924601362"] = true, ["124427228784862"] = true, 
+    ["136523051723440"] = true, ["71186534081075"] = true, ["115580881672346"] = true, 
+    ["123778544771528"] = true, ["133303451091615"] = true, ["95901746347992"] = true, 
+    ["116432619539029"] = true, ["92595499555055"] = true, ["113722638806911"] = true, 
+    ["86045680364061"] = true, ["99731350629462"] = true, ["72249315151281"] = true, 
+    ["74145636023952"] = true, ["92081142332466"] = true, ["94223344057046"] = true, 
+    ["72467492674240"] = true, ["120914276661831"] = true, ["118483280891531"] = true, 
+    ["117371289990421"] = true, ["95494223368246"] = true, ["76957377224584"] = true, 
+    ["84712031901002"] = true, ["118076716434659"] = true, ["105826208784475"] = true, 
+    ["97972100634587"] = true, ["136536827155962"] = true, ["77826020629176"] = true, 
+    ["89652378115594"] = true, ["86618245908620"] = true, ["108374320117834"] = true, 
+    ["137451357351000"] = true, ["81210313723714"] = true, ["115683433001643"] = true, 
+    ["115589615022077"] = true, ["109069266611522"] = true, ["101079657277587"] = true, 
+    ["89009042593684"] = true, ["121239701968766"] = true, ["114277419400774"] = true, 
+    ["102221764735089"] = true, ["100811576955331"] = true, ["85699847295318"] = true, 
+    ["120136894011461"] = true, ["84448423136678"] = true, ["85024950165903"] = true, 
+    ["89977758316911"] = true, ["84527203471730"] = true, ["124243904748268"] = true, 
+    ["99516000246972"] = true, ["122015481201264"] = true, ["105068005007692"] = true, 
+    ["131948591638044"] = true, ["107067953428369"] = true, ["129876493950288"] = true, 
+    ["95077220586856"] = true, ["73048386765082"] = true, ["117045209683198"] = true, 
+    ["123171106092050"] = true, ["138852224035589"] = true, ["74442134184452"] = true, 
+    ["106649604455931"] = true, ["73482562876920"] = true, ["100446064103831"] = true, 
+    ["131904892480473"] = true, ["108865650924154"] = true, ["131031842057158"] = true, 
+    ["85569553424083"] = true, ["76313364850487"] = true, ["104749346956269"] = true, 
+    ["131219281339199"] = true, ["137654778575373"] = true, ["111593784328268"] = true, 
+    ["124644660953423"] = true, ["108123475959041"] = true, ["72424828296871"] = true, 
+    ["87911292272963"] = true, ["132748613906344"] = true, ["88911658010897"] = true, 
+    ["129132347098646"] = true, ["122952270797174"] = true, ["96047028540271"] = true, 
+    ["134461702265323"] = true, ["91916094481547"] = true, ["81971779090581"] = true, 
+    ["86293749971049"] = true, ["80465501985014"] = true, ["132754851925571"] = true, 
+    ["108407413391495"] = true, ["119211164876773"] = true, ["83335984810473"] = true, 
+    ["93796567192197"] = true, ["134777193523837"] = true, ["111720035828971"] = true, 
+    ["94902423288896"] = true, ["131506102901134"] = true, ["91984445049000"] = true, 
+    ["84039122607068"] = true, ["77833820443705"] = true, ["72063002791216"] = true, 
+    ["72475960800126"] = true
+}
+
+local parsedMoveIds = {}
+for k, v in pairs(moveIds) do
+    if type(k) == "number" then
+        parsedMoveIds[tostring(v)] = true
+    else
+        parsedMoveIds[tostring(k)] = true
+    end
+end
+
+local function getRandomDodge()
+    local available = {}
+    for _, id in ipairs(dodgeIds) do
+        if id ~= lastDodgeId then
+            table.insert(available, id)
+        end
+    end
+    if #available == 0 then available = dodgeIds end
+    local chosen = available[math.random(1, #available)]
+    lastDodgeId = chosen
+    return chosen
+end
+
+-- PROJECTILE DODGE LOGIC
+local function executeProjectileDodge(projectilePart, incomingDir)
+    if not scriptActive or not isEnabled then return end
+    local now = os.clock()
+    if now - lastProjTime < PROJ_COOLDOWN then return end
+    lastProjTime = now
+
+    local myChar = localPlayer.Character
+    if not myChar then return end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    local myHumanoid = myChar:FindFirstChildOfClass("Humanoid")
+    if not myRoot or not myHumanoid then return end
+
+    local upVector = Vector3.new(0, 1, 0)
+    local rightVector = incomingDir:Cross(upVector).Unit
+    
+    if rightVector.Magnitude == 0 or rightVector.Magnitude ~= rightVector.Magnitude then
+        rightVector = Vector3.new(1, 0, 0)
+    end
+    
+    local dodgeDir = (math.random() > 0.5) and rightVector or -rightVector
+    local dodgeDist = 18 
+    
+    local targetWorldPos = myRoot.Position + (dodgeDir * dodgeDist)
+    local targetCFrame = CFrame.lookAt(
+        Vector3.new(targetWorldPos.X, myRoot.Position.Y, targetWorldPos.Z), 
+        Vector3.new(myRoot.Position.X - (incomingDir.X * 10), myRoot.Position.Y, myRoot.Position.Z - (incomingDir.Z * 10))
+    )
+
+    local dodgeId = getRandomDodge()
+    local anim = Instance.new("Animation")
+    anim.AnimationId = "rbxassetid://" .. dodgeId
+    local animator = myHumanoid:FindFirstChildOfClass("Animator") or myHumanoid:WaitForChild("Animator", 1)
+    
+    if animator then
+        local track = animator:LoadAnimation(anim)
+        track:Play()
+        task.delay(0.6, function()
+            if track and track.IsPlaying then track:Stop() end
+            if track then track:Destroy() end
+        end)
+    end
+
+    if autoM1Enabled then
+        m1LockedOutUntil = os.clock() + 0.5
+        pcall(function()
+            local tool = myChar:FindFirstChildOfClass("Tool")
+            if tool then
+                tool:Activate()
+            else
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                task.wait(0.05)
+                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+            end
+        end)
+    elseif autoBlockEnabled then
+        task.delay(currentBlockDelay, function()
+            if not scriptActive or not isEnabled then return end
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+                task.delay(0.1, function()
+                    pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
+                end)
+            end)
+        end)
+    end
+
+    local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(myRoot, tweenInfo, {CFrame = targetCFrame})
+    tween:Play()
+end
+
+-- PROJECTILE TRACKING
+local trackedProjectiles = {}
+
+connect(Workspace.DescendantAdded, function(descendant)
+    if not scriptActive then return end
+    if descendant:IsA("BasePart") and not descendant.Anchored then
+        if descendant.Parent and descendant.Parent:FindFirstChildOfClass("Humanoid") then return end
+        trackedProjectiles[descendant] = os.clock()
+    end
+end)
+
+connect(Workspace.DescendantRemoving, function(descendant)
+    if not scriptActive then return end
+    trackedProjectiles[descendant] = nil
+end)
+
+connect(RunService.Heartbeat, function()
+    if not scriptActive or not isEnabled or not autoProjEnabled then return end
+    
+    local now = os.clock()
+    local myChar = localPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return end
+
+    for part, addTime in pairs(trackedProjectiles) do
+        if not part or not part.Parent then
+            trackedProjectiles[part] = nil
+            continue
+        end
+
+        if now - addTime > 3 then
+            trackedProjectiles[part] = nil
+            continue
+        end
+        
+        local success, vel = pcall(function() return part.AssemblyLinearVelocity end)
+        if success and vel and vel.Magnitude > 35 then
+            local dist = (part.Position - myRoot.Position).Magnitude
+            if dist <= currentProjRange and dist >= currentProjMinRange then
+                local dirToMe = (myRoot.Position - part.Position).Unit
+                local velDir = vel.Unit
+                local dotProduct = dirToMe:Dot(velDir)
+                
+                if dotProduct > 0.92 then
+                    executeProjectileDodge(part, velDir)
+                    trackedProjectiles[part] = nil
+                end
+            end
+        end
+    end
+end)
+
+-- STANDARD MELEE DODGE LOGIC
+local function executeSmoothDodge(enemyRoot)
+    if not scriptActive or not isEnabled then return end
+    local now = os.clock()
+    if now - lastTeleportTime < COOLDOWN then return end
+    lastTeleportTime = now
+
+    local myChar = localPlayer.Character
+    if not myChar then return end
+    local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+    local myHumanoid = myChar:FindFirstChildOfClass("Humanoid")
+    if not myRoot or not myHumanoid then return end
+
+    local wasSpecialInterrupted = false
+    if currentSpecialCleanup then
+        currentSpecialCleanup()
+        currentSpecialCleanup = nil
+        wasSpecialInterrupted = true
+    end
+
+    local isSpecialProc = not wasSpecialInterrupted and (math.random(1, 20) == 1)
+
+    if isSpecialProc then
+        local enemyHead = enemyRoot.Parent and enemyRoot.Parent:FindFirstChild("Head") or enemyRoot
+        local targetCFrame = CFrame.new(enemyHead.Position + Vector3.new(0, 3.5, 0)) * CFrame.Angles(0, math.rad(enemyRoot.Orientation.Y), 0)
+        
+        myRoot.CFrame = targetCFrame
+
+        local originalWalkSpeed = myHumanoid.WalkSpeed
+        local originalJumpPower = myHumanoid.JumpPower
+        myHumanoid.WalkSpeed = 0
+        myHumanoid.JumpPower = 0
+
+        local anim = Instance.new("Animation")
+        anim.AnimationId = "rbxassetid://84458677375099"
+        local animator = myHumanoid:FindFirstChildOfClass("Animator") or myHumanoid:WaitForChild("Animator", 1)
+        
+        if animator then
+            local track = animator:LoadAnimation(anim)
+            track:Play()
+            
+            local fallConn
+            local isCleanedUp = false
+
+            local function cleanup()
+                if isCleanedUp then return end
+                isCleanedUp = true
+                if currentSpecialCleanup == cleanup then currentSpecialCleanup = nil end
+                if fallConn then fallConn:Disconnect() fallConn = nil end
+                if lockOnConnection then lockOnConnection:Disconnect() lockOnConnection = nil end
+
+                local camera = Workspace.CurrentCamera
+                if camera then
+                    camera.CameraType = Enum.CameraType.Custom
+                    if myHumanoid then
+                        camera.CameraSubject = myHumanoid
+                        myHumanoid.WalkSpeed = originalWalkSpeed
+                        myHumanoid.JumpPower = originalJumpPower
+                    end
+                end
+
+                if track and track.IsPlaying then track:Stop() end
+                if track then track:Destroy() end
+            end
+
+            currentSpecialCleanup = cleanup
+
+            task.delay(0.15, function()
+                if not scriptActive or isCleanedUp then return end
+                if myHumanoid:GetState() == Enum.HumanoidStateType.Freefall or myHumanoid:GetState() == Enum.HumanoidStateType.FallingDown then
+                    cleanup()
+                    return
+                end
+
+                fallConn = myHumanoid.StateChanged:Connect(function(_, newState)
+                    if newState == Enum.HumanoidStateType.Freefall or newState == Enum.HumanoidStateType.FallingDown then
+                        cleanup()
+                    end
+                end)
+            end)
+
+            task.delay(2.5, function() cleanup() end)
+        end
+
+        if autoM1Enabled then
+            m1LockedOutUntil = os.clock() + 0.5
+            pcall(function()
+                local tool = myChar:FindFirstChildOfClass("Tool")
+                if tool then
+                    tool:Activate()
+                else
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                    task.wait(0.05)
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+                end
+            end)
+        elseif autoBlockEnabled then
+            task.delay(currentBlockDelay, function()
+                if not scriptActive or not isEnabled then return end
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+                    task.delay(0.1, function() pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end) end)
+                end)
+            end)
+        end
+
+        local camera = Workspace.CurrentCamera
+        if lockOnConnection then lockOnConnection:Disconnect() end
+        
+        camera.CameraType = Enum.CameraType.Scriptable
+        local startTime = os.clock()
+        local duration = 2.5
+
+        lockOnConnection = RunService.RenderStepped:Connect(function()
+            if not scriptActive then
+                if lockOnConnection then lockOnConnection:Disconnect() lockOnConnection = nil end
+                return
+            end
+            local elapsed = os.clock() - startTime
+            
+            if elapsed >= duration or not enemyRoot or not enemyRoot.Parent or not myRoot or not myRoot.Parent then
+                if lockOnConnection then lockOnConnection:Disconnect() lockOnConnection = nil end
+                camera.CameraType = Enum.CameraType.Custom
+                if myHumanoid then camera.CameraSubject = myHumanoid end
+                return
+            end
+
+            local myPos = myRoot.Position
+            local enemyPos = enemyRoot.Position
+            local camPos = myPos + Vector3.new(0, 4, 8)
+            camera.CFrame = CFrame.lookAt(camPos, enemyPos)
+        end)
+    else
+        local randomAngle = math.rad(math.random(120, 240))
+        local randomDist = math.random(40, 60) / 10
+        local relativeOffset = Vector3.new(math.sin(randomAngle) * randomDist, 0, -math.cos(randomAngle) * randomDist)
+        
+        local targetWorldPos = (enemyRoot.CFrame * CFrame.new(relativeOffset)).Position
+        local targetCFrame = CFrame.lookAt(
+            Vector3.new(targetWorldPos.X, myRoot.Position.Y, targetWorldPos.Z), 
+            Vector3.new(enemyRoot.Position.X, myRoot.Position.Y, enemyRoot.Position.Z)
+        )
+
+        local dodgeId = getRandomDodge()
+        local anim = Instance.new("Animation")
+        anim.AnimationId = "rbxassetid://" .. dodgeId
+        local animator = myHumanoid:FindFirstChildOfClass("Animator") or myHumanoid:WaitForChild("Animator", 1)
+        
+        if animator then
+            local track = animator:LoadAnimation(anim)
+            track:Play()
+            task.delay(0.6, function()
+                if track and track.IsPlaying then track:Stop() end
+                if track then track:Destroy() end
+            end)
+        end
+
+        if autoM1Enabled then
+            m1LockedOutUntil = os.clock() + 0.5
+            pcall(function()
+                local tool = myChar:FindFirstChildOfClass("Tool")
+                if tool then
+                    tool:Activate()
+                else
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+                    task.wait(0.05)
+                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+                end
+            end)
+        elseif autoBlockEnabled then
+            task.delay(currentBlockDelay, function()
+                if not scriptActive or not isEnabled then return end
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+                    task.delay(0.1, function() pcall(function() VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game) end) end)
+                end)
+            end)
+        end
+
+        local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+        local tween = TweenService:Create(myRoot, tweenInfo, {CFrame = targetCFrame})
+        tween:Play()
+
+        local camera = Workspace.CurrentCamera
+        if lockOnConnection then lockOnConnection:Disconnect() end
+        
+        camera.CameraType = Enum.CameraType.Scriptable
+        local startTime = os.clock()
+        local duration = 0.6
+
+        lockOnConnection = RunService.RenderStepped:Connect(function()
+            if not scriptActive then
+                if lockOnConnection then lockOnConnection:Disconnect() lockOnConnection = nil end
+                return
+            end
+            local elapsed = os.clock() - startTime
+            
+            if elapsed >= duration or not enemyRoot or not enemyRoot.Parent or not myRoot or not myRoot.Parent then
+                if lockOnConnection then lockOnConnection:Disconnect() lockOnConnection = nil end
+                camera.CameraType = Enum.CameraType.Custom
+                if myHumanoid then camera.CameraSubject = myHumanoid end
+                return
+            end
+
+            local myPos = myRoot.Position
+            local enemyPos = enemyRoot.Position
+            local offsetDir = (myPos - enemyPos).Unit
+            if offsetDir.Magnitude == 0 then offsetDir = Vector3.new(0, 0, 1) end
+            
+            local camPos = myPos + (offsetDir * 10) + Vector3.new(0, 3, 0)
+            camera.CFrame = CFrame.lookAt(camPos, enemyPos)
+        end)
+    end
+end
+
+local function monitorLocalPlayer()
+    local function setupHumanoid(hum)
+        connect(hum.AnimationPlayed, function(track)
+            if not scriptActive then return end
+            if os.clock() < m1LockedOutUntil then
+                pcall(function()
+                    if track and track.Animation and track.Animation.AnimationId then
+                        local id = track.Animation.AnimationId:match("%d+")
+                        if id and m1Ids[id] then
+                            track:Stop()
+                        end
+                    end
+                end)
+            end
+        end)
+    end
+
+    local char = localPlayer.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then setupHumanoid(hum) end
+    end
+    connect(localPlayer.CharacterAdded, function(newChar)
+        if not scriptActive then return end
+        local hum = newChar:WaitForChild("Humanoid", 5)
+        if hum then setupHumanoid(hum) end
+    end)
+end
+monitorLocalPlayer()
+
+local function monitorHumanoid(humanoid, character)
+    if character == localPlayer.Character then return end
+    
+    connect(humanoid.AnimationPlayed, function(track)
+        if not scriptActive or not isEnabled then return end
+        
+        pcall(function()
+            if track and track.Animation and track.Animation.AnimationId then
+                local id = track.Animation.AnimationId:match("%d+")
+                if id then
+                    local requiredRange = nil
+                    local isSpecialMove = false
+                    
+                    if chaseDashIds[id] then
+                        requiredRange = currentDashRange
+                    elseif m1Ids[id] then
+                        requiredRange = currentM1Range
+                    elseif parsedMoveIds[id] then
+                        requiredRange = currentMoveRange
+                        isSpecialMove = true
+                    end
+                    
+                    if requiredRange then
+                        local myChar = localPlayer.Character
+                        if not myChar then return end
+                        local myRoot = myChar:FindFirstChild("HumanoidRootPart")
+                        local enemyRoot = character:FindFirstChild("HumanoidRootPart")
+                        
+                        if myRoot and enemyRoot then
+                            local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+                            if dist <= requiredRange and dist >= currentMinRange then
+                                if isSpecialMove then
+                                    task.delay(currentMoveDelay, function()
+                                        if not scriptActive or not isEnabled then return end
+                                        local curChar = localPlayer.Character
+                                        if not curChar then return end
+                                        local curRoot = curChar:FindFirstChild("HumanoidRootPart")
+                                        if curRoot and enemyRoot and enemyRoot.Parent then
+                                            local d = (enemyRoot.Position - curRoot.Position).Magnitude
+                                            if d <= currentMoveRange and d >= currentMinRange then
+                                                executeSmoothDodge(enemyRoot)
+                                            end
+                                        end
+                                    end)
+
+                                    task.spawn(function()
+                                        local startTime = os.clock()
+                                        local stopped = false
+                                        local conn
+                                        
+                                        local stopConn = track.Stopped:Connect(function()
+                                            stopped = true
+                                            if conn then conn:Disconnect() end
+                                        end)
+                                        
+                                        conn = RunService.Heartbeat:Connect(function()
+                                            if not scriptActive or stopped or not track.IsPlaying or not character.Parent then
+                                                if conn then conn:Disconnect() end
+                                                if stopConn then stopConn:Disconnect() end
+                                                return
+                                            end
+                                            
+                                            if os.clock() - startTime >= 1 then
+                                                stopped = true
+                                                if conn then conn:Disconnect() end
+                                                if stopConn then stopConn:Disconnect() end
+                                                
+                                                if not scriptActive or not isEnabled then return end
+                                                local curChar = localPlayer.Character
+                                                if not curChar then return end
+                                                local curRoot = curChar:FindFirstChild("HumanoidRootPart")
+                                                local enemyRoot = character:FindFirstChild("HumanoidRootPart")
+                                                if curRoot and enemyRoot and enemyRoot.Parent then
+                                                    local d = (enemyRoot.Position - curRoot.Position).Magnitude
+                                                    if d <= currentMoveRange and d >= currentMinRange then
+                                                        executeSmoothDodge(enemyRoot)
+                                                    end
+                                                end
+                                            end
+                                        end)
+                                    end)
+                                else
+                                    executeSmoothDodge(enemyRoot)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end)
+end
+
+local function monitorModel(model)
+    if not model:IsA("Model") then return end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        monitorHumanoid(humanoid, model)
+    end
+    connect(model.ChildAdded, function(child)
+        if not scriptActive then return end
+        if child:IsA("Humanoid") then
+            monitorHumanoid(child, model)
+        end
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    connect(p.CharacterAdded, function(char)
+        if not scriptActive then return end
+        local humanoid = char:WaitForChild("Humanoid", 5)
+        if humanoid then monitorHumanoid(humanoid, char) end
+    end)
+    if p.Character then
+        local humanoid = p.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid then monitorHumanoid(humanoid, p.Character) end
+    end
+end
+
+connect(Players.PlayerAdded, function(player)
+    connect(player.CharacterAdded, function(char)
+        if not scriptActive then return end
+        local humanoid = char:WaitForChild("Humanoid", 5)
+        if humanoid then monitorHumanoid(humanoid, char) end
+    end)
+end)
+
+for _, obj in ipairs(Workspace:GetChildren()) do
+    monitorModel(obj)
+end
+connect(Workspace.ChildAdded, function(obj)
+    if not scriptActive then return end
+    monitorModel(obj)
+end)
